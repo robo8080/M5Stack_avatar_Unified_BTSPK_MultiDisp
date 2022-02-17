@@ -5,8 +5,11 @@
 #ifndef DRAWCONTEXT_H_
 #define DRAWCONTEXT_H_
 
+#if defined( ARDUINO_M5STACK_FIRE ) || defined(ARDUINO_M5STACK_Core2)
+#define COLOR_DEPTH 8
+#else
 #define COLOR_DEPTH 1
-//#define COLOR_DEPTH 8
+#endif
 #define ERACER_COLOR 0x0000
 
 #include "ColorPalette.h"

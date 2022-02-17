@@ -19,10 +19,20 @@ LGFX_Device* gfx2 = nullptr;
 int16_t lipsync_level = 0;
 
 #include "Avatar.h"
-
+#if defined( ARDUINO_M5STACK_FIRE ) || defined(ARDUINO_M5STACK_Core2)
+#define USE_ATARU_FACE
+#ifdef USE_ATARU_FACE  
+#include "AtaruFace.h"
+#endif
+#endif
 using namespace m5avatar;
 
 Avatar avatar;
+#ifdef USE_ATARU_FACE  
+Face* face;
+ColorPalette* cp;
+#endif
+
 /// need ESP32-A2DP library. ( URL : https://github.com/pschatzmann/ESP32-A2DP/ )
 #include <BluetoothA2DPSink.h>
 
@@ -76,38 +86,62 @@ protected:
     _meta_bits = (1<<metatext_num)-1;
   }
 
+  void av_hdl_a2d_evt(uint16_t event, void *p_param) override
+  {
+    esp_a2d_cb_param_t* a2d = (esp_a2d_cb_param_t *)(p_param);
+
+    switch (event) {
+    case ESP_A2D_CONNECTION_STATE_EVT:
+      if (ESP_A2D_CONNECTION_STATE_CONNECTED == a2d->conn_stat.state)
+      { // 接続
+//          Serial.printf("connected\n\r");  
+          avatar.setExpression(Expression::Neutral);    
+      }
+      else
+      if (ESP_A2D_CONNECTION_STATE_DISCONNECTED == a2d->conn_stat.state)
+      { // 切断
+//          Serial.printf("disconnected\n\r");      
+          avatar.setExpression(Expression::Sleepy);    
+      }
+      break;
+
+    case ESP_A2D_AUDIO_STATE_EVT:
+      if (ESP_A2D_AUDIO_STATE_STARTED == a2d->audio_stat.state)
+      { // 再生
+        avatar.setExpression(Expression::Neutral);    
+      } else
+      if ( ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND == a2d->audio_stat.state
+        || ESP_A2D_AUDIO_STATE_STOPPED        == a2d->audio_stat.state )
+      { // 停止
+        clearMetaData();
+        avatar.setExpression(Expression::Doubt);    
+      }
+      break;
+    }
+
+    BluetoothA2DPSink::av_hdl_a2d_evt(event, p_param);
+  }
+
   void av_hdl_avrc_evt(uint16_t event, void *p_param) override
   {
-//    Serial.printf("event = %d \n\r",event);
+    esp_avrc_ct_cb_param_t *rc = (esp_avrc_ct_cb_param_t *)(p_param);
+
     switch (event)
     {
     case ESP_AVRC_CT_METADATA_RSP_EVT:
+      for (size_t i = 0; i < metatext_num; ++i)
       {
-        esp_avrc_ct_cb_param_t *rc = (esp_avrc_ct_cb_param_t *)(p_param);
-        uint8_t id = rc->meta_rsp.attr_id;
-        for (size_t i = 0; i < metatext_num; ++i)
-        {
-          if (0 == (id & (1 << i))) { continue; }
-          strncpy(_meta_text[i], (char*)(rc->meta_rsp.attr_text), metatext_size);
-          _meta_bits |= id;
-          break;
-        }
+        if (0 == (rc->meta_rsp.attr_id & (1 << i))) { continue; }
+        strncpy(_meta_text[i], (char*)(rc->meta_rsp.attr_text), metatext_size);
+        _meta_bits |= rc->meta_rsp.attr_id;
+        break;
       }
       break;
 
     case ESP_AVRC_CT_CONNECTION_STATE_EVT:
-      {
-        esp_avrc_ct_cb_param_t *rc = (esp_avrc_ct_cb_param_t *)(p_param);
-        if (rc->conn_stat.connected) {
-//          Serial.printf("connected\n\r");  
-          avatar.setExpression(Expression::Neutral);    
-        } else {
-//          Serial.printf("disconnected\n\r");      
-          avatar.setExpression(Expression::Sleepy);    
-        }
-      }
+      break;
+
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
-      clearMetaData();
       break;
 
     default:
@@ -119,9 +153,10 @@ protected:
 
   void audio_data_callback(const uint8_t *data, uint32_t length) override
   {
-    if (M5.Speaker.isPlaying(m5spk_virtual_channel) == 2)
+    /// When the queue is empty or full, delay processing is performed.
+    if (M5.Speaker.isPlaying(m5spk_virtual_channel) != 1)
     {
-      vTaskDelay(10 / portTICK_RATE_MS);
+      vTaskDelay(5 / portTICK_RATE_MS);
       while (M5.Speaker.isPlaying(m5spk_virtual_channel) == 2) { taskYIELD(); }
     }
     bool flip = !_flip_index;
@@ -144,7 +179,7 @@ protected:
 };
 
 
-#define FFT_SIZE 512
+#define FFT_SIZE 256
 class fft_t
 {
   float _wr[FFT_SIZE + 1];
@@ -243,9 +278,9 @@ static uint16_t peak_y[(FFT_SIZE/2)+1];
 static int header_height = 0;
 
 
-void drawSetup(LGFX_Device* gfx)
+void gfxSetup(LGFX_Device* gfx)
 {
-//  gfx->init();
+  if (gfx == nullptr) { return; }
   gfx->setRotation(3);
 //  if (gfx->width() < gfx->height())
 //  {
@@ -253,18 +288,26 @@ void drawSetup(LGFX_Device* gfx)
 //  }
   gfx->setFont(&fonts::lgfxJapanGothic_12);
   gfx->setEpdMode(epd_mode_t::epd_fastest);
-  gfx->setCursor(0, 12);
+  gfx->setCursor(0, 8);
   gfx->startWrite(); /// Omit the paired endWrite.
   gfx->print("BT A2DP : ");
   gfx->println(bt_device_name);
   gfx->setTextWrap(false);
-  gfx->fillRect(0, 8, gfx->width(), 3, TFT_BLACK);
+  gfx->fillRect(0, 6, gfx->width(), 2, TFT_BLACK);
 
+  header_height = 45;
   fft_enabled = !gfx->isEPD();
+
+  for (int x = 0; x < (FFT_SIZE/2)+1; ++x)
+  {
+    prev_y[x] = INT16_MAX;
+    peak_y[x] = INT16_MAX;
+  }
 }
 
-void drawLoop(LGFX_Device* gfx)
+void gfxLoop(LGFX_Device* gfx)
 {
+  if (gfx == nullptr) { return; }
   auto bits = a2dp_sink.getMetaUpdateInfo();
   if (bits)
   {
@@ -272,8 +315,8 @@ void drawLoop(LGFX_Device* gfx)
     for (int id = 0; id < 8; ++id)
     {
       if (0 == (bits & (1<<id))) { continue; }
-      gfx->setCursor(0, 12 + id * 12);
-      gfx->fillRect(0, 12 + id * 12, gfx->width(), 12, gfx->getBaseColor());
+      gfx->setCursor(0, 8 + id * 12);
+      gfx->fillRect(0, 8 + id * 12, gfx->width(), 12, gfx->getBaseColor());
       gfx->print(a2dp_sink.getMetaData(id));
       gfx->print(" "); // Garbage data removal when UTF8 characters are broken in the middle.
     }
@@ -288,7 +331,7 @@ void drawLoop(LGFX_Device* gfx)
     int x = v * (gfx->width()) >> 8;
     if (px != x)
     {
-      gfx->fillRect(x, 8, px - x, 3, px < x ? TFT_GREEN : TFT_BLACK);
+      gfx->fillRect(x, 6, px - x, 2, px < x ? 0xAAFFAAu : 0u);
       gfx->display();
       px = x;
     }
@@ -329,52 +372,62 @@ void drawLoop(LGFX_Device* gfx)
         int px = prev_x[i];
         if (px != x)
         {
-          gfx->fillRect(x, i * 4, px - x, 3, px < x ? 0x0055FFu : 0u);
+          gfx->fillRect(x, i * 3, px - x, 2, px < x ? 0xFF9900u : 0x330000u);
           prev_x[i] = x;
         }
-        px = peak_x[i] - 1;
+        px = peak_x[i];
         if (px > x)
         {
-          gfx->writeFastVLine(px + 1, i * 4, 3, TFT_BLACK);
+          gfx->writeFastVLine(px, i * 3, 2, TFT_BLACK);
+          px--;
         }
         else
         {
-          px = x + 1;
+          px = x;
         }
         if (peak_x[i] != px)
         {
           peak_x[i] = px;
-          gfx->writeFastVLine(px, i * 4, 3, TFT_WHITE);
+          gfx->writeFastVLine(px, i * 3, 2, TFT_WHITE);
         }
       }
       gfx->display();
 
       // draw FFT level meter
       fft.exec(data);
+      int bw = gfx->width() / 60;
+      if (bw < 3) { bw = 3; }
       int dsp_height = gfx->height();
       int fft_height = dsp_height - header_height;
-      int xe = gfx->width() >> 2;
-      if (xe > (FFT_SIZE/2)+1) { xe = (FFT_SIZE/2)+1; }
+      int xe = gfx->width() / bw;
+      if (xe > (FFT_SIZE/2)) { xe = (FFT_SIZE/2); }
       int32_t lipsync_temp = 0;
-      for (int x = 0; x < xe; ++x)
+      for (int x = 0; x <= xe; ++x)
       {
+        if (((x * bw) & 7) == 0) { gfx->display(); }
         int32_t f = fft.get(x) * fft_height;
-        int y = dsp_height - std::min(fft_height, f >> 19);
-//        Serial.printf("f:%d, f1:%d, x:%d, xe: %d, y:%d\n", f >> 19, f1, x, xe, y);
-//        Serial.printf("f:%d, x:%d, xe: %d, y:%d\n", f >> 19, x, xe, y);
-        if (x > 5 and x < 32) { // 0〜31の範囲でlipsyncでピックアップしたい音域を選びます。
-          lipsync_temp = std::max(lipsync_temp, f >> 19); // 指定した範囲で最も高い音量を設定。
+        if (x > 0 and x < 10) { // 0〜31の範囲でlipsyncでピックアップしたい音域を選びます。
+          int32_t f1 = fft.get(x) * 100;
+          lipsync_temp = std::max(lipsync_temp, f1 >> 19); // 指定した範囲で最も高い音量を設定。
         }
+        int y = f >> 19;
+        if (y > fft_height) { y = fft_height; }
+        y = dsp_height - y;
+//        Serial.printf("f:%d, x:%d, xe: %d, y:%d lipsync_temp:%d\n", f >> 19, x, xe, y, lipsync_temp);
         int py = prev_y[x];
         if (y != py)
         {
-          gfx->fillRect(x*4, y, 3, py - y, (y < py) ? 0x0099FFu : 0u);
+          if (x > 0 and x < 10) { // 0〜31の範囲でlipsyncでピックアップしたい音域を選びます。
+          gfx->fillRect(x * bw, y, bw - 1, py - y, (y < py) ? 0x00F800u : 0x000033u);
+          } else {
+          gfx->fillRect(x * bw, y, bw - 1, py - y, (y < py) ? 0x99AAFFu : 0x000033u);
+          }
           prev_y[x] = y;
         }
         py = peak_y[x] + 1;
         if (py < y)
         {
-          gfx->writeFastHLine(x*4, py-1, 3, TFT_BLACK);
+          gfx->writeFastHLine(x * bw, py - 1, bw - 1, TFT_BLACK);
         }
         else
         {
@@ -383,7 +436,7 @@ void drawLoop(LGFX_Device* gfx)
         if (peak_y[x] != py)
         {
           peak_y[x] = py;
-          gfx->writeFastHLine(x*4, py, 3, TFT_WHITE);
+          gfx->writeFastHLine(x * bw, py, bw - 1, TFT_WHITE);
         }
       }
       lipsync_level = lipsync_temp; // リップシンクを設定
@@ -403,17 +456,17 @@ void lipSync(void *args)
     //int level = a2dp_sink.audio_level;
 //    printf("data=%d\n\r",lipsync_level);
     lipsync_level = abs(lipsync_level);
-//    if(lipsync_level > 26)
-    if(lipsync_level > 50)
+//    lipsync_level *= 3;
+    if(lipsync_level > 80)
     {
-      lipsync_level = 50;
+      lipsync_level = 80;
 //      avatar->setExpression(Expression::Happy);
     }
 //    else
 //    {
 //      avatar->setExpression(Expression::Neutral);
 //    }
-    float open = (float)lipsync_level/50.0;
+    float open = (float)lipsync_level/80.0;
     avatar->setMouthOpenRatio(open);
     avatar->getGaze(&gazeY, &gazeX);
     avatar->setRotation(gazeX * 10);
@@ -434,7 +487,7 @@ void setup()
 
   /// Increasing the sample_rate will improve the sound quality instead of increasing the CPU load.
   auto spk_cfg = M5.Speaker.config();
-  spk_cfg.sample_rate = 125000; // default:48000 (48kHz)
+//  spk_cfg.sample_rate = 125000; // default:48000 (48kHz)
   M5.Speaker.config(spk_cfg);
   M5.Speaker.begin();
   M5.Display.setBrightness(128);
@@ -454,16 +507,34 @@ void setup()
     gfx2 = new M5UnitOLED();
     gfx2->init();
   }
-  drawSetup(gfx2);
-  
+  gfxSetup(gfx2);
+#ifdef USE_ATARU_FACE  
+  face = new AtaruFace();
+  cp = new ColorPalette();
+  cp->set(COLOR_PRIMARY, TFT_BLACK);
+  cp->set(COLOR_BACKGROUND, TFT_WHITE);
+  cp->set(COLOR_SECONDARY, TFT_WHITE);
+#endif
   avatar.init(); // start drawing
-  avatar.setExpression(Expression::Sleepy);
+#ifdef USE_ATARU_FACE  
+  avatar.setFace(face);
+  avatar.setColorPalette(*cp);
+#endif
+  avatar.setExpression(Expression::Sleepy);    
   avatar.addTask(lipSync, "lipSync");
+//  xTaskCreatePinnedToCore(
+//                    lipSync1,     /* Function to implement the task */
+//                    "lipSync1",   /* Name of the task */
+//                    1024,      /* Stack size in words */
+//                    NULL,      /* Task input parameter */
+//                    3,         /* Priority of the task */
+//                    NULL,      /* Task handle. */
+//                    0);        /* Core where the task should run */
 }
 
 void loop(void)
 {
-  drawLoop(gfx2);
+  gfxLoop(gfx2);
 
   {
     static int prev_frame;
