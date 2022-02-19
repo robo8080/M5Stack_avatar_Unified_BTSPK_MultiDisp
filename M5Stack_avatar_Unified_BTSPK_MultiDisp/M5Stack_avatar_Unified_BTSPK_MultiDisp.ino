@@ -20,7 +20,7 @@ int16_t lipsync_level = 0;
 
 #include "Avatar.h"
 #if defined( ARDUINO_M5STACK_FIRE ) || defined(ARDUINO_M5STACK_Core2)
-#define USE_ATARU_FACE
+//#define USE_ATARU_FACE
 #ifdef USE_ATARU_FACE  
 #include "AtaruFace.h"
 #endif
@@ -76,6 +76,7 @@ protected:
   bool _flip_index = 0;
   char _meta_text[metatext_num][metatext_size];
   uint8_t _meta_bits = 0;
+  size_t _sample_rate = 48000;
 
   void clearMetaData(void)
   {
@@ -94,13 +95,11 @@ protected:
     case ESP_A2D_CONNECTION_STATE_EVT:
       if (ESP_A2D_CONNECTION_STATE_CONNECTED == a2d->conn_stat.state)
       { // 接続
-//          Serial.printf("connected\n\r");  
           avatar.setExpression(Expression::Neutral);    
       }
       else
       if (ESP_A2D_CONNECTION_STATE_DISCONNECTED == a2d->conn_stat.state)
       { // 切断
-//          Serial.printf("disconnected\n\r");      
           avatar.setExpression(Expression::Sleepy);    
       }
       break;
@@ -116,6 +115,21 @@ protected:
         clearMetaData();
         avatar.setExpression(Expression::Doubt);    
       }
+      break;
+
+    case ESP_A2D_AUDIO_CFG_EVT:
+      {
+        esp_a2d_cb_param_t *a2d = (esp_a2d_cb_param_t *)(p_param);
+        size_t tmp = a2d->audio_cfg.mcc.cie.sbc[0];
+        size_t rate = 16000;
+        if (     tmp & (1 << 6)) { rate = 32000; }
+        else if (tmp & (1 << 5)) { rate = 44100; }
+        else if (tmp & (1 << 4)) { rate = 48000; }
+        _sample_rate = rate;
+      }
+      break;
+
+    default:
       break;
     }
 
@@ -174,7 +188,7 @@ protected:
     }
     memcpy(_flip_buf[flip], data, length);
     _flip_index = flip;
-    M5.Speaker.playRAW(_flip_buf[flip], length >> 1, this->i2s_config.sample_rate, true, 1, m5spk_virtual_channel);
+    M5.Speaker.playRAW(_flip_buf[flip], length >> 1, _sample_rate, true, 1, m5spk_virtual_channel);
   }
 };
 
@@ -278,6 +292,22 @@ static uint16_t peak_y[(FFT_SIZE/2)+1];
 static int header_height = 0;
 
 
+uint32_t bgcolor(LGFX_Device* gfx, int y)
+{
+  auto h = gfx->height();
+  auto dh = h - header_height;
+  int v = ((h - y)<<5) / dh;
+  if (dh > 40)
+  {
+    int v2 = ((h - y + 1)<<5) / dh;
+    if ((v >> 2) != (v2 >> 2))
+    {
+      return 0x666666u;
+    }
+  }
+  return gfx->color888(v + 2, v, v + 6);
+}
+
 void gfxSetup(LGFX_Device* gfx)
 {
   if (gfx == nullptr) { return; }
@@ -289,7 +319,6 @@ void gfxSetup(LGFX_Device* gfx)
   gfx->setFont(&fonts::lgfxJapanGothic_12);
   gfx->setEpdMode(epd_mode_t::epd_fastest);
   gfx->setCursor(0, 8);
-  gfx->startWrite(); /// Omit the paired endWrite.
   gfx->print("BT A2DP : ");
   gfx->println(bt_device_name);
   gfx->setTextWrap(false);
@@ -297,6 +326,13 @@ void gfxSetup(LGFX_Device* gfx)
 
   header_height = 45;
   fft_enabled = !gfx->isEPD();
+  if (fft_enabled)
+  {
+    for (int y = header_height; y < gfx->height(); ++y)
+    {
+      gfx->drawFastHLine(0, y, gfx->width(), bgcolor(gfx, y));
+    }
+  }
 
   for (int x = 0; x < (FFT_SIZE/2)+1; ++x)
   {
@@ -312,7 +348,7 @@ void gfxLoop(LGFX_Device* gfx)
   if (bits)
   {
     gfx->startWrite();
-    for (int id = 0; id < 8; ++id)
+    for (int id = 0; id < a2dp_sink.metatext_num; ++id)
     {
       if (0 == (bits & (1<<id))) { continue; }
       gfx->setCursor(0, 8 + id * 12);
@@ -398,36 +434,36 @@ void gfxLoop(LGFX_Device* gfx)
       int bw = gfx->width() / 60;
       if (bw < 3) { bw = 3; }
       int dsp_height = gfx->height();
-      int fft_height = dsp_height - header_height;
+      int fft_height = dsp_height - header_height - 1;
       int xe = gfx->width() / bw;
       if (xe > (FFT_SIZE/2)) { xe = (FFT_SIZE/2); }
       int32_t lipsync_temp = 0;
       for (int x = 0; x <= xe; ++x)
       {
         if (((x * bw) & 7) == 0) { gfx->display(); }
-        int32_t f = fft.get(x) * fft_height;
+        int32_t f = fft.get(x);
+        int y = (f * fft_height) >> 18;
         if (x > 0 and x < 10) { // 0〜31の範囲でlipsyncでピックアップしたい音域を選びます。
-          int32_t f1 = fft.get(x) * 100;
+          int32_t f1 = f * 100;
           lipsync_temp = std::max(lipsync_temp, f1 >> 19); // 指定した範囲で最も高い音量を設定。
         }
-        int y = f >> 19;
         if (y > fft_height) { y = fft_height; }
         y = dsp_height - y;
-//        Serial.printf("f:%d, x:%d, xe: %d, y:%d lipsync_temp:%d\n", f >> 19, x, xe, y, lipsync_temp);
         int py = prev_y[x];
         if (y != py)
         {
-          if (x > 0 and x < 10) { // 0〜31の範囲でlipsyncでピックアップしたい音域を選びます。
-          gfx->fillRect(x * bw, y, bw - 1, py - y, (y < py) ? 0x00F800u : 0x000033u);
-          } else {
-          gfx->fillRect(x * bw, y, bw - 1, py - y, (y < py) ? 0x99AAFFu : 0x000033u);
-          }
+//          gfx->fillRect(x * bw, y, bw - 1, py - y, (y < py) ? 0x99AAFFu : 0x000033u);
+            if (x > 0 and x < 10) { // 0〜31の範囲でlipsyncでピックアップしたい音域を選びます。
+              gfx->fillRect(x * bw, y, bw - 1, py - y, (y < py) ? 0x00F800u : 0x000033u);
+            } else {
+              gfx->fillRect(x * bw, y, bw - 1, py - y, (y < py) ? 0x99AAFFu : 0x000033u);
+            }
           prev_y[x] = y;
         }
         py = peak_y[x] + 1;
         if (py < y)
         {
-          gfx->writeFastHLine(x * bw, py - 1, bw - 1, TFT_BLACK);
+          gfx->writeFastHLine(x * bw, py - 1, bw - 1, bgcolor(gfx, py - 1));
         }
         else
         {
@@ -457,19 +493,19 @@ void lipSync(void *args)
 //    printf("data=%d\n\r",lipsync_level);
     lipsync_level = abs(lipsync_level);
 //    lipsync_level *= 3;
-    if(lipsync_level > 80)
+    if(lipsync_level > 100)
     {
-      lipsync_level = 80;
+      lipsync_level = 100;
 //      avatar->setExpression(Expression::Happy);
     }
 //    else
 //    {
 //      avatar->setExpression(Expression::Neutral);
 //    }
-    float open = (float)lipsync_level/80.0;
+    float open = (float)lipsync_level/100.0;
     avatar->setMouthOpenRatio(open);
-    avatar->getGaze(&gazeY, &gazeX);
-    avatar->setRotation(gazeX * 10);
+//    avatar->getGaze(&gazeY, &gazeX);
+//    avatar->setRotation(gazeX * 10);
     delay(50);
   }
 }
@@ -485,11 +521,16 @@ void setup()
   M5.begin(cfg);
 
 
-  /// Increasing the sample_rate will improve the sound quality instead of increasing the CPU load.
-  auto spk_cfg = M5.Speaker.config();
-//  spk_cfg.sample_rate = 125000; // default:48000 (48kHz)
-  M5.Speaker.config(spk_cfg);
+  { /// custom setting
+    auto spk_cfg = M5.Speaker.config();
+    /// Increasing the sample_rate will improve the sound quality instead of increasing the CPU load.
+    spk_cfg.sample_rate = 96000; // default:48000 (48kHz)  e.g. 50000 , 80000 , 96000 , 100000 , 144000 , 192000
+    M5.Speaker.config(spk_cfg);
+  }
+
+
   M5.Speaker.begin();
+
   M5.Display.setBrightness(128);
   
   header_height = 48;
